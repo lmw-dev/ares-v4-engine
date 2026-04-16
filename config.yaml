@@ -1,0 +1,45 @@
+# Ares v4.0 全局配置
+# 敏感字段（API Key、路径）请在 .env 文件中设置，本文件仅存放非敏感配置
+
+engine:
+  version: "4.0"
+  # 战术稳定性熵值阈值：超过此值触发 CRITICAL_WARNING
+  entropy_threshold: 0.7
+  # 核心节点缺阵时的熵值惩罚增量
+  key_node_absence_penalty: 0.4
+  # S 级情报有效期（天），超期自动降权
+  s_source_ttl_days: 21
+
+llm:
+  # LLM provider: openai | gemini | openai_compat
+  # 环境变量 ARES_LLM_PROVIDER 优先级更高
+  provider: openai
+  # 推演温度（0.0-1.0，越低越确定）
+  temperature: 0.2
+  # 最大输出 Token 数
+  max_tokens: 600
+
+rag:
+  # ChromaDB 持久化存储路径（相对于项目根目录）
+  persist_directory: "./chromadb"
+  # RAG 检索返回 Top-N 历史文本
+  top_k: 3
+  # Collection 名称
+  collection_name: "ares_tactical_memory"
+
+obsidian:
+  # 球队档案子目录名（相对于 ARES_VAULT_PATH）
+  team_archives_subdir: "02_Team_Archives"
+  # 支持的联赛子文件夹
+  leagues:
+    - "Premier_League"
+    - "La_Liga"
+    - "Serie_A"
+    - "Bundesliga"
+    - "Ligue_1"
+
+delivery:
+  # 是否在审计后自动写回 Obsidian 档案
+  obsidian_writeback: true
+  # 是否发送 Discord 通知
+  discord_enabled: true
