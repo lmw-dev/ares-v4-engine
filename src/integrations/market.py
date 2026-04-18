@@ -27,6 +27,7 @@ class OddsInput:
     draw_odds: float
     away_odds: float
     is_home: bool = True
+    strength_gap_index: float = 0.0
 
     @property
     def target_odds(self) -> float:
@@ -133,7 +134,11 @@ def compute_ev(
     ev_score = round(model_prob - market_prob, 4)
     expected_value = round(model_prob * odds_input.target_odds - 1, 4)
 
-    if ev_score > ev_threshold_positive and expected_value > 0:
+    # 护城河校验：如果绝对实力差距压倒一切，则无视市场表现强制认定为正路
+    if odds_input.strength_gap_index > 1.5:
+        ev_tag = "TRUE_FAVORITE"
+        decision = "✅ 正路 - 实力绝对碾压，无视市场资金挤压"
+    elif ev_score > ev_threshold_positive and expected_value > 0:
         ev_tag = "EV+"
         decision = "✅ 可博 - 市场低估真实鲁棒性，存在超额价值"
     elif ev_score < ev_threshold_negative or s_dynamic > 0.7:

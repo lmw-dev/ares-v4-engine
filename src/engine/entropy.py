@@ -163,13 +163,26 @@ def compute_entropy(
     s += tactical_risk
     risk_flags.extend(tac_flags)
 
-    # 4. 比分压力修正（可选 match_context）
+    # 4. 比分压力与比赛语境修正（可选 match_context）
     score_status = inp.match_context.get("score_status", "")
     match_time = int(inp.match_context.get("time", 0))
     if score_status == "Trailing" and match_time > 60:
         s += 0.1
         risk_flags.append("🔵 落后+60min(+0.10)")
         logger.info("比分压力情景：落后且超过60分钟，熵值 +0.10")
+
+    stakes = inp.match_context.get("stakes", "")
+    team_status = inp.match_context.get("team_status", "")
+    
+    if stakes == "relegation_battle":
+        s -= 0.10
+        risk_flags.append("🔶 默契/惧败 [DRAW_BIAS] (-0.10)")
+        logger.info("语境情景：保级生死战，转换降维，熵值 -0.10")
+        
+    if team_status == "relegated_no_pressure":
+        s += 0.20
+        risk_flags.append("🎴 薛定谔防线 [WILDCARD] (+0.20)")
+        logger.info("语境情景：已降级无压力，方差极大，熵值 +0.20")
 
     # 对动态熵值进行封顶，避免发生线性溢出
     s = min(s, 1.0000)
