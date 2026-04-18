@@ -171,6 +171,9 @@ def compute_entropy(
         risk_flags.append("🔵 落后+60min(+0.10)")
         logger.info("比分压力情景：落后且超过60分钟，熵值 +0.10")
 
+    # 对动态熵值进行封顶，避免发生线性溢出
+    s = min(s, 1.0000)
+
     # 5. 阈值熔断
     status = (
         "CRITICAL_WARNING"

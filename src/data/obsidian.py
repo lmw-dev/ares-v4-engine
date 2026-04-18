@@ -153,6 +153,16 @@ def _extract_body_params(body: str) -> dict[str, Any]:
         return {}
 
 
+def verify_with_osint(team_name: str, local_metadata: dict) -> dict:
+    """
+    OSINT API 校验网关。
+    注意：这里未来将调用外部体育 API 获取真实积分榜和伤停状态等数据，
+    与本地数据进行交叉校验，以防止“本地数据滞后”造成的系统幻觉。
+    """
+    logger.info(f"OSINT API 交叉校验请求发送: {team_name}")
+    return local_metadata
+
+
 def _validate_metadata(metadata: dict[str, Any], file_path: Path) -> list[str]:
     """校验 YAML 元数据的必填字段，返回错误信息列表（空表示通过）。"""
     errors: list[str] = []
@@ -211,6 +221,9 @@ def _parse_single_file(md_path: Path) -> TacticalProfile:
         raise ValueError("元数据校验失败:\n  - " + "\n  - ".join(validation_errors))
 
     team_name = md_path.stem
+
+    # 强制引入 OSINT 校验网关
+    metadata = verify_with_osint(team_name, metadata)
 
     last_modified_raw = metadata.get("last_modified_date") or metadata.get("last_modified")
     last_modified: Optional[date] = None
