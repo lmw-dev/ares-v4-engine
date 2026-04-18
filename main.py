@@ -86,6 +86,10 @@ def cli():
     "--trailing", is_flag=True, default=False,
     help="模拟落后且超过60分钟的比分压力场景"
 )
+@click.option("--stakes", default=None, type=click.Choice(["relegation_battle"]), help="比赛特殊语境（如保级生死战）")
+@click.option("--team-status", default=None, type=click.Choice(["relegated_no_pressure"]), help="球队特殊状态（如无压力降级）")
+@click.option("--points-gap", type=float, default=0.0, help="两队场均积分差 (用于计算实力护城河)")
+@click.option("--xg-gap", type=float, default=0.0, help="两队 xG 预计进球差 (用于计算实力护城河)")
 @click.option(
     "--provider", "-p", default=None,
     type=click.Choice(["openai", "gemini", "openai_compat"], case_sensitive=False),
@@ -100,6 +104,10 @@ def audit(
     odds: Optional[tuple[float, float, float]],
     away: bool,
     trailing: bool,
+    stakes: Optional[str],
+    team_status: Optional[str],
+    points_gap: float,
+    xg_gap: float,
     provider: Optional[str],
     model: Optional[str],
     base_url: Optional[str],
@@ -150,7 +158,12 @@ def audit(
     # 3. 熵值计算
     match_context = {}
     if trailing:
-        match_context = {"score_status": "Trailing", "time": "65"}
+        match_context["score_status"] = "Trailing"
+        match_context["time"] = "65"
+    if stakes:
+        match_context["stakes"] = stakes
+    if team_status:
+        match_context["team_status"] = team_status
 
     entropy_input = EntropyInput(
         team_name=profile.team_name,
@@ -213,12 +226,17 @@ def audit(
     ev_result = None
     if odds:
         home_odds, draw_odds, away_odds = odds
+        
+        # 计算 Strength Gap Index
+        strength_gap_index = (points_gap * 1.0) + (xg_gap * 0.5)
+        
         odds_input = OddsInput(
             team_name=profile.team_name,
             home_odds=home_odds,
             draw_odds=draw_odds,
             away_odds=away_odds,
             is_home=not away,
+            strength_gap_index=strength_gap_index,
         )
         ev_result = compute_ev(
             odds_input=odds_input,
