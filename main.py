@@ -30,7 +30,7 @@ from src.engine.simulator import (
 )
 from src.integrations.market import OddsInput, compute_ev
 from src.utils.llm_client import load_llm_config, LLMConfig
-from src.integrations.delivery import deliver_results
+from src.integrations.delivery import build_audit_report, save_audit_report
 from src.utils.logger import (
     setup_logger,
     print_banner,
@@ -86,8 +86,6 @@ def cli():
     "--trailing", is_flag=True, default=False,
     help="模拟落后且超过60分钟的比分压力场景"
 )
-@click.option("--no-discord", is_flag=True, default=False, help="禁用 Discord 投递")
-@click.option("--no-writeback", is_flag=True, default=False, help="禁用 Obsidian 写回")
 @click.option(
     "--provider", "-p", default=None,
     type=click.Choice(["openai", "gemini", "openai_compat"], case_sensitive=False),
@@ -102,8 +100,6 @@ def audit(
     odds: Optional[tuple[float, float, float]],
     away: bool,
     trailing: bool,
-    no_discord: bool,
-    no_writeback: bool,
     provider: Optional[str],
     model: Optional[str],
     base_url: Optional[str],
@@ -113,7 +109,6 @@ def audit(
     config = _load_config()
     engine_cfg = config.get("engine", {})
     rag_cfg = config.get("rag", {})
-    delivery_cfg = config.get("delivery", {})
 
     # CLI 参数覆盖环境变量（临时注入，不污染 .env）
     if provider:
@@ -232,23 +227,19 @@ def audit(
         )
         console.print(f"\n[bold]📊 EV 分析:[/bold] {ev_result.summary()}")
 
-    # 6. 结果交付
-    discord_enabled = delivery_cfg.get("discord_enabled", True) and not no_discord
-    obsidian_writeback = delivery_cfg.get("obsidian_writeback", True) and not no_writeback
+    # 6. 生成战报并落盘到 03_Match_Audits/
+    report_md = build_audit_report(entropy_result, simulation_report, ev_result)
 
-    delivery_results = deliver_results(
-        entropy=entropy_result,
-        simulation=simulation_report,
-        ev=ev_result,
-        obsidian_file=profile.file_path if obsidian_writeback else None,
-        discord_enabled=discord_enabled,
-        obsidian_writeback=obsidian_writeback,
-    )
-
-    if delivery_results.get("discord"):
-        print_success("审计结果已投递至 Discord")
-    if delivery_results.get("obsidian"):
-        print_success("审计结果已写回 Obsidian 档案")
+    vault_path_str = os.environ.get("ARES_VAULT_PATH", "")
+    if vault_path_str:
+        try:
+            saved_path = save_audit_report(vault_path_str, profile.team_name, report_md)
+            print_success(f"独立战报已落盘: {saved_path}")
+        except OSError as exc:
+            console.print(f"[red]❌ 战报写入失败: {exc}[/red]")
+    else:
+        print_warning("ARES_VAULT_PATH 未配置，战报未写入磁盘。")
+        console.print(report_md)
 
     print_success(f"审计完成: {profile.team_name}")
 
