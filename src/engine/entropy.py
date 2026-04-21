@@ -10,7 +10,7 @@ Ares v4.0 - 动态战术稳定性熵值 (S_dynamic) 计算引擎
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal
 
 from src.utils.logger import setup_logger
 
@@ -29,6 +29,8 @@ class EntropyInput:
     absent_players: list[str] = field(default_factory=list)
     locked_players: list[str] = field(default_factory=list)
     match_context: dict[str, str] = field(default_factory=dict)
+    xg: float = 0.0
+    passes_attacking_third: int = 0
 
 
 @dataclass
@@ -40,7 +42,7 @@ class EntropyResult:
     s_dynamic: float
     threshold: float
     status: str
-    penalty_breakdown: list[dict[str, float]] = field(default_factory=list)
+    penalty_breakdown: list[dict[str, str | float]] = field(default_factory=list)
     risk_flags: list[str] = field(default_factory=list)
 
     @property
@@ -92,6 +94,19 @@ TACTICAL_RISK_MAP: dict[str, dict[str, float]] = {
 KEY_NODE_ABSENCE_PENALTY = 0.4
 KEY_NODE_LOCKED_PENALTY = 0.25
 
+# S_dynamic 最终安全边界
+S_DYNAMIC_MIN = 0.10
+S_DYNAMIC_MAX = 0.90
+
+# 对攻转化效率阈值及修正项
+EFFICIENCY_LETHAL_THRESHOLD = 0.08
+EFFICIENCY_WASTEFUL_THRESHOLD = 0.03
+EFFICIENCY_WASTEFUL_PASSES_THRESHOLD = 50
+EFFICIENCY_LETHAL_MODIFIER = -0.15
+EFFICIENCY_WASTEFUL_MODIFIER = 0.10
+
+EfficiencyBand = Literal["LETHAL", "WASTEFUL", "NORMAL"]
+
 
 def _calculate_tactical_risk(tactical_logic: dict[str, str]) -> tuple[float, list[str]]:
     """根据战术维度标签计算总体风险修正值。"""
@@ -110,6 +125,115 @@ def _calculate_tactical_risk(tactical_logic: dict[str, str]) -> tuple[float, lis
     return total_risk, flags
 
 
+def _clip(value: float, lower: float, upper: float) -> float:
+    """将数值限制在 [lower, upper] 区间。"""
+    if lower > upper:
+        raise ValueError(f"invalid clip bounds: lower={lower}, upper={upper}")
+    return max(lower, min(value, upper))
+
+
+def _calculate_efficiency_modifier(
+    xg: float,
+    passes_attacking_third: int,
+) -> tuple[float, float, EfficiencyBand]:
+    """
+    计算对攻转化效率修正项。
+
+    efficiency_ratio = xG / (passes_attacking_third + 1.0)
+    """
+    safe_xg = max(float(xg), 0.0)
+    safe_passes = max(int(passes_attacking_third), 0)
+    efficiency_ratio = safe_xg / (safe_passes + 1.0)
+
+    if efficiency_ratio > EFFICIENCY_LETHAL_THRESHOLD:
+        modifier = EFFICIENCY_LETHAL_MODIFIER
+        band: EfficiencyBand = "LETHAL"
+        logger.info(
+            "效率因子[Lethal]: ratio=%.4f (> %.2f), 修正 %.2f",
+            efficiency_ratio,
+            EFFICIENCY_LETHAL_THRESHOLD,
+            modifier,
+        )
+    elif (
+        efficiency_ratio < EFFICIENCY_WASTEFUL_THRESHOLD
+        and safe_passes > EFFICIENCY_WASTEFUL_PASSES_THRESHOLD
+    ):
+        modifier = EFFICIENCY_WASTEFUL_MODIFIER
+        band = "WASTEFUL"
+        logger.warning(
+            "效率因子[Wasteful]: ratio=%.4f (< %.2f) 且 passes=%d (> %d), 修正 +%.2f",
+            efficiency_ratio,
+            EFFICIENCY_WASTEFUL_THRESHOLD,
+            safe_passes,
+            EFFICIENCY_WASTEFUL_PASSES_THRESHOLD,
+            modifier,
+        )
+    else:
+        modifier = 0.0
+        band = "NORMAL"
+        logger.info(
+            "效率因子[Normal]: ratio=%.4f, 修正 %.2f",
+            efficiency_ratio,
+            modifier,
+        )
+
+    return modifier, efficiency_ratio, band
+
+
+def calculate_s_dynamic(
+    s_base: float,
+    fear_factor_modifier: float,
+    injury_modifier: float,
+    xg: float,
+    passes_attacking_third: int,
+    clip_lower: float = S_DYNAMIC_MIN,
+    clip_upper: float = S_DYNAMIC_MAX,
+) -> tuple[float, float, float, EfficiencyBand]:
+    """
+    计算最终动态熵值。
+
+    新公式:
+        S_dynamic = S_base + Fear_Factor_Modifier + Injury_Modifier + Efficiency_Modifier
+
+    其中:
+        efficiency_ratio = xG / (passes_attacking_third + 1.0)
+    """
+    efficiency_modifier, efficiency_ratio, efficiency_band = _calculate_efficiency_modifier(
+        xg=xg,
+        passes_attacking_third=passes_attacking_third,
+    )
+
+    raw_s_dynamic = (
+        float(s_base)
+        + float(fear_factor_modifier)
+        + float(injury_modifier)
+        + efficiency_modifier
+    )
+    clipped_s_dynamic = _clip(raw_s_dynamic, clip_lower, clip_upper)
+
+    logger.info(
+        "S_dynamic 分解: S_base=%.3f, Fear=%.3f, Injury=%.3f, Efficiency=%.3f -> raw=%.3f",
+        s_base,
+        fear_factor_modifier,
+        injury_modifier,
+        efficiency_modifier,
+        raw_s_dynamic,
+    )
+
+    if clipped_s_dynamic != raw_s_dynamic:
+        logger.warning(
+            "S_dynamic 安全截断触发: raw=%.3f, clipped=%.3f, bounds=[%.2f, %.2f]",
+            raw_s_dynamic,
+            clipped_s_dynamic,
+            clip_lower,
+            clip_upper,
+        )
+    else:
+        logger.info("S_dynamic 无需截断: %.3f", clipped_s_dynamic)
+
+    return clipped_s_dynamic, efficiency_modifier, efficiency_ratio, efficiency_band
+
+
 def compute_entropy(
     inp: EntropyInput,
     key_node_absence_penalty: float = KEY_NODE_ABSENCE_PENALTY,
@@ -117,12 +241,6 @@ def compute_entropy(
 ) -> EntropyResult:
     """
     计算动态战术稳定性熵值 S_dynamic。
-
-    公式:
-        S_dynamic = S_base
-                  + Σ(缺阵节点 × absence_penalty)
-                  + Σ(被锁节点 × locked_penalty)
-                  + Σ(战术维度风险修正)
 
     Args:
         inp:                       熵值计算输入参数。
@@ -132,72 +250,90 @@ def compute_entropy(
     Returns:
         EntropyResult 对象。
     """
-    s = inp.tactical_entropy_base
-    penalty_breakdown: list[dict[str, float]] = []
+    s_base = inp.tactical_entropy_base
+    fear_factor_modifier = 0.0
+    injury_modifier = 0.0
+
+    penalty_breakdown: list[dict[str, str | float]] = []
     risk_flags: list[str] = []
 
     # 1. 缺阵惩罚：关键节点在 absent_players 列表中
-    absent_key_nodes = [
-        p for p in inp.absent_players if p in inp.key_node_dependency
-    ]
+    absent_key_nodes = [p for p in inp.absent_players if p in inp.key_node_dependency]
     for player in absent_key_nodes:
         penalty = key_node_absence_penalty
-        s += penalty
+        injury_modifier += penalty
         penalty_breakdown.append({"player": player, "type": "absent", "penalty": penalty})
         risk_flags.append(f"🔴 {player} 缺阵(+{penalty:.2f})")
-        logger.warning(f"关键节点 [{player}] 缺阵，熵值 +{penalty:.2f}")
+        logger.warning("关键节点 [%s] 缺阵，Injury_Modifier +%.2f", player, penalty)
 
     # 2. 被锁死惩罚：关键节点在 locked_players 列表中
-    locked_key_nodes = [
-        p for p in inp.locked_players if p in inp.key_node_dependency
-    ]
+    locked_key_nodes = [p for p in inp.locked_players if p in inp.key_node_dependency]
     for player in locked_key_nodes:
         penalty = key_node_locked_penalty
-        s += penalty
+        injury_modifier += penalty
         penalty_breakdown.append({"player": player, "type": "locked", "penalty": penalty})
         risk_flags.append(f"🟠 {player} 被锁死(+{penalty:.2f})")
-        logger.warning(f"关键节点 [{player}] 被战术封锁，熵值 +{penalty:.2f}")
+        logger.warning("关键节点 [%s] 被战术封锁，Injury_Modifier +%.2f", player, penalty)
 
     # 3. 战术维度风险修正
     tactical_risk, tac_flags = _calculate_tactical_risk(inp.tactical_logic)
-    s += tactical_risk
+    fear_factor_modifier += tactical_risk
     risk_flags.extend(tac_flags)
+    logger.info("战术风险汇总: Fear_Factor_Modifier %+0.2f", tactical_risk)
 
     # 4. 比分压力与比赛语境修正（可选 match_context）
     score_status = inp.match_context.get("score_status", "")
     match_time = int(inp.match_context.get("time", 0))
     if score_status == "Trailing" and match_time > 60:
-        s += 0.1
+        fear_factor_modifier += 0.10
         risk_flags.append("🔵 落后+60min(+0.10)")
-        logger.info("比分压力情景：落后且超过60分钟，熵值 +0.10")
+        logger.info("比分压力情景：落后且超过60分钟，Fear_Factor_Modifier +0.10")
 
     stakes = inp.match_context.get("stakes", "")
     team_status = inp.match_context.get("team_status", "")
-    
-    if stakes == "relegation_battle":
-        s -= 0.10
-        risk_flags.append("🔶 默契/惧败 [DRAW_BIAS] (-0.10)")
-        logger.info("语境情景：保级生死战，转换降维，熵值 -0.10")
-        
-    if team_status == "relegated_no_pressure":
-        s += 0.20
-        risk_flags.append("🎴 薛定谔防线 [WILDCARD] (+0.20)")
-        logger.info("语境情景：已降级无压力，方差极大，熵值 +0.20")
 
-    # 对动态熵值进行封顶，避免发生线性溢出
-    s = min(s, 1.0000)
+    if stakes == "relegation_battle":
+        fear_factor_modifier -= 0.10
+        risk_flags.append("🔶 默契/惧败 [DRAW_BIAS] (-0.10)")
+        logger.info("语境情景：保级生死战，Fear_Factor_Modifier -0.10")
+
+    if team_status == "relegated_no_pressure":
+        fear_factor_modifier += 0.20
+        risk_flags.append("🎴 薛定谔防线 [WILDCARD] (+0.20)")
+        logger.info("语境情景：已降级无压力，Fear_Factor_Modifier +0.20")
+
+    s_dynamic, efficiency_modifier, efficiency_ratio, efficiency_band = calculate_s_dynamic(
+        s_base=s_base,
+        fear_factor_modifier=fear_factor_modifier,
+        injury_modifier=injury_modifier,
+        xg=inp.xg,
+        passes_attacking_third=inp.passes_attacking_third,
+    )
+
+    if efficiency_band == "LETHAL":
+        risk_flags.append(
+            f"🗡️ 对攻转化效率[Lethal] ({efficiency_ratio:.4f}, {efficiency_modifier:+.2f})"
+        )
+    elif efficiency_band == "WASTEFUL":
+        risk_flags.append(
+            f"🧱 对攻转化效率[Wasteful] ({efficiency_ratio:.4f}, {efficiency_modifier:+.2f})"
+        )
+
+    penalty_breakdown.append(
+        {
+            "type": "efficiency_modifier",
+            "penalty": efficiency_modifier,
+            "efficiency_ratio": round(efficiency_ratio, 4),
+        }
+    )
 
     # 5. 阈值熔断
-    status = (
-        "CRITICAL_WARNING"
-        if s > inp.system_fragility_threshold
-        else "STABLE"
-    )
+    status = "CRITICAL_WARNING" if s_dynamic > inp.system_fragility_threshold else "STABLE"
 
     result = EntropyResult(
         team_name=inp.team_name,
-        s_base=inp.tactical_entropy_base,
-        s_dynamic=round(s, 4),
+        s_base=s_base,
+        s_dynamic=round(s_dynamic, 4),
         threshold=inp.system_fragility_threshold,
         status=status,
         penalty_breakdown=penalty_breakdown,
@@ -206,12 +342,17 @@ def compute_entropy(
 
     if result.is_critical:
         logger.error(
-            f"⚠️ [{inp.team_name}] 体系崩坏预警！"
-            f"S_dynamic={result.s_dynamic:.3f} > 阈值={result.threshold:.3f}"
+            "⚠️ [%s] 体系崩坏预警！S_dynamic=%.3f > 阈值=%.3f",
+            inp.team_name,
+            result.s_dynamic,
+            result.threshold,
         )
     else:
         logger.info(
-            f"[{inp.team_name}] 熵值计算完成: S={result.s_dynamic:.3f} ({status})"
+            "[%s] 熵值计算完成: S=%.3f (%s)",
+            inp.team_name,
+            result.s_dynamic,
+            status,
         )
 
     return result

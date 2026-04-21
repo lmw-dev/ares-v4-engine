@@ -58,6 +58,7 @@ ares-v4-engine/
     2. 使用 `python-frontmatter` 提取 YAML 头部。
         
     3. 提取必须包含且结构完整的字段：`version`, `tactical_entropy_base`, `key_node_dependency` (List), `tactical_logic` (Dict)。
+       支持可选赛后遥测字段：`xG` (float)、`passes_attacking_third` (int)。
         
     4. 添加异常处理（`FileNotFoundError`, YAML 格式错误等）。
         
@@ -68,9 +69,18 @@ ares-v4-engine/
     
 - **参数权重**：
     
-    - 基础值 = `tactical_entropy_base`。
-        
-    - 若 RAG 库或外部情报确认 `key_node_dependency`（如 Rodri）缺阵或被锁死，熵值需剧增（如 +0.4）。
+    - 基础值 = `tactical_entropy_base`（记为 `S_base`）。
+    - `Fear_Factor_Modifier`：战术矩阵风险 + 比分/语境修正。
+    - `Injury_Modifier`：关键节点缺阵/锁死惩罚累加。
+    - `Efficiency_Modifier`：由赛后遥测 `xG` 与 `passes_attacking_third` 计算。
+      - `efficiency_ratio = xG / (passes_attacking_third + 1.0)`
+      - `efficiency_ratio > 0.08` -> `Efficiency_Modifier = -0.15`
+      - `efficiency_ratio < 0.03 且 passes_attacking_third > 50` -> `Efficiency_Modifier = +0.10`
+      - 其余 -> `0.0`
+    - 汇总公式：
+      - `S_dynamic = S_base + Fear_Factor_Modifier + Injury_Modifier + Efficiency_Modifier`
+    - 安全边界：
+      - 最终输出必须执行 `clip(S_dynamic, 0.1, 0.9)`，防止数值溢出/下溢。
         
 - **阈值熔断**：当最终 $S > 0.7$ 时，标记 `status = 'CRITICAL_WARNING'`。
     
@@ -108,6 +118,8 @@ tactical_logic:
   F: S
   H: H
   Set_Piece: A
+xG: 1.35
+passes_attacking_third: 72
 ---
 # 此处为 Markdown 正文内容...
 ```

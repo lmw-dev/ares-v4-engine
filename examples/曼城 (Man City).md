@@ -14,6 +14,8 @@ tactical_logic:
 last_modified_date: 2026-04-10
 source_level: S
 source: "The Athletic - Manchester City Tactical Report 2026"
+xG: 1.72
+passes_attacking_third: 84
 ---
 
 # 曼城 (Man City) - 战术内核档案 v4.0

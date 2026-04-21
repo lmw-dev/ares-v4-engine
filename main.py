@@ -56,6 +56,22 @@ def _load_config() -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    """安全地将输入转换为 float，失败时返回默认值。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """安全地将输入转换为 int，失败时返回默认值。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ── CLI 主命令组 ──────────────────────────────────────────────────────────────
 
 @click.group()
@@ -174,6 +190,14 @@ def audit(
         absent_players=list(absent),
         locked_players=list(locked),
         match_context=match_context,
+        xg=_safe_float(
+            profile.raw_metadata.get("xG", profile.raw_metadata.get("xg", 0.0)),
+            default=0.0,
+        ),
+        passes_attacking_third=_safe_int(
+            profile.raw_metadata.get("passes_attacking_third", 0),
+            default=0,
+        ),
     )
     entropy_result = compute_entropy(
         entropy_input,

@@ -14,6 +14,8 @@ tactical_logic:
 last_modified_date: 2026-04-08
 source_level: A
 source: "Coaches' Voice - Real Madrid Press Analysis 2026"
+xG: 1.21
+passes_attacking_third: 61
 ---
 
 # 皇马 (Real Madrid) - 战术内核档案 v4.0

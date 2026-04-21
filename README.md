@@ -84,10 +84,24 @@ python main.py audit \
 
 ```
 S_dynamic = S_base
-          + Σ(缺阵关键节点 × 0.40)
-          + Σ(被锁关键节点 × 0.25)
-          + Σ(战术维度风险修正)
-          + 比分压力修正（落后>60min: +0.10）
+          + Fear_Factor_Modifier
+          + Injury_Modifier
+          + Efficiency_Modifier
+
+其中：
+  Fear_Factor_Modifier = Σ(战术维度风险修正) + 比分/语境修正
+  Injury_Modifier      = Σ(缺阵关键节点 × 0.40) + Σ(被锁关键节点 × 0.25)
+  efficiency_ratio     = xG / (passes_attacking_third + 1.0)
+
+  if efficiency_ratio > 0.08:
+      Efficiency_Modifier = -0.15
+  elif efficiency_ratio < 0.03 and passes_attacking_third > 50:
+      Efficiency_Modifier = +0.10
+  else:
+      Efficiency_Modifier = 0.0
+
+最终安全约束：
+  S_dynamic = clip(S_dynamic, 0.1, 0.9)
 
 当 S_dynamic > threshold（默认 0.7）时 → CRITICAL_WARNING
 ```
@@ -126,6 +140,8 @@ tactical_logic:                  # 战术矩阵（字典）
   F: S
   H: H
   Set_Piece: A
+xG: 1.35                         # 可选：赛后遥测 xG (float)
+passes_attacking_third: 72       # 可选：进攻三区成功传球数 (int)
 ---
 ```
 
