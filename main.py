@@ -593,7 +593,9 @@ def audit_issue(issue: str, manifest: Optional[str], limit: Optional[int]):
         print_success(f"Prematch 审计已写入: {output_file}")
         processed += 1
 
+    summary_payload = {"issue": issue, "processed": processed, "failed": failed}
     print_info(f"audit-issue 完成: 成功 {processed} / 失败 {failed}")
+    print(f"AUDIT_ISSUE_SUMMARY {json.dumps(summary_payload, ensure_ascii=False)}")
 
 
 # ── scan 命令：批量扫描所有档案 ──────────────────────────────────────────────
