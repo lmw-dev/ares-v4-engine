@@ -192,16 +192,18 @@ def _call_llm(prompt: str, llm_config: Optional[LLMConfig] = None) -> str:
             max_tokens=600,
         )
     except Exception as exc:
-        logger.error(f"LLM 推演失败，返回占位结果: {exc}")
-        return f"[LLM 推演失败: {type(exc).__name__}]"
+        logger.error(f"LLM 推演失败，触发停机占位结果: {exc}")
+        return HALT_MARKER
 
 
 def _extract_success_rate(llm_output: str) -> float:
     """从 LLM 输出中提取概率数字（简单启发式解析）。"""
     import re
+    if HALT_MARKER in llm_output:
+        return 0.0
     matches = re.findall(r"(\d{1,3})\s*%", llm_output)
     if not matches:
-        return 0.5
+        return 0.0
     rates = [int(m) / 100.0 for m in matches]
     return round(sum(rates) / len(rates), 3)
 
@@ -334,6 +336,8 @@ def run_pressure_test(
                 halted=HALT_MARKER in llm_output,
             )
         )
+        if HALT_MARKER in llm_output:
+            halt_triggered = True
         logger.info(f"[{team_name}] {scenario.name} 完成，成功率预估={success_rate:.0%}")
 
     # 计算加权整体韧性评分

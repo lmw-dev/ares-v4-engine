@@ -82,9 +82,11 @@ def save_audit_report(
     vault_path_str: str,
     team_name: str,
     report_content: str,
+    output_dir: Optional[Path] = None,
+    output_path: Optional[Path] = None,
 ) -> Path:
     """
-    将审计战报落盘到 ``ARES_VAULT_PATH/03_Match_Audits/``。
+    将审计战报落盘到 ``ARES_VAULT_PATH/03_Match_Audits/`` 或指定目标路径。
 
     文件名格式: ``YYYYMMDD_HHMMSS-{team_name}-Audit.md``
 
@@ -92,6 +94,8 @@ def save_audit_report(
         vault_path_str: Obsidian Vault 根目录路径字符串。
         team_name:      球队名称，用于构造文件名（空格转下划线）。
         report_content: Markdown 战报正文。
+        output_dir:     可选，自定义输出目录。
+        output_path:    可选，自定义输出文件路径；优先级高于 output_dir。
 
     Returns:
         写入成功的 Path 对象。
@@ -99,12 +103,19 @@ def save_audit_report(
     Raises:
         OSError: 目录创建或文件写入失败时抛出。
     """
-    audits_dir = Path(vault_path_str).expanduser().resolve() / "03_Match_Audits"
-    audits_dir.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = team_name.replace(" ", "_").replace("/", "-")
-    filepath = audits_dir / f"{timestamp}-{safe_name}-Audit.md"
+    if output_path is not None:
+        filepath = Path(output_path).expanduser().resolve()
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        audits_dir = (
+            Path(output_dir).expanduser().resolve()
+            if output_dir is not None
+            else Path(vault_path_str).expanduser().resolve() / "03_Match_Audits"
+        )
+        audits_dir.mkdir(parents=True, exist_ok=True)
+        filepath = audits_dir / f"{timestamp}-{safe_name}-Audit.md"
 
     filepath.write_text(report_content, encoding="utf-8")
     logger.info(f"审计战报已落盘: {filepath}")

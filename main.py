@@ -9,10 +9,12 @@ Ares v4.0 动态战术压力审计引擎 - 主程序入口
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import click
 import yaml
@@ -47,6 +49,18 @@ from src.utils.logger import (
 logger = setup_logger("ares.main", log_file="ares_audit.log")
 
 
+@dataclass
+class AuditExecutionResult:
+    """单次球队审计的完整产物。"""
+
+    profile: TacticalProfile
+    entropy_result: object
+    simulation_report: object
+    ev_result: object | None
+    report_md: str
+    saved_path: Optional[Path] = None
+
+
 def _load_config() -> dict:
     """加载 config.yaml 全局配置。"""
     config_path = Path(__file__).parent / "config.yaml"
@@ -70,6 +84,313 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_vault_path() -> Optional[Path]:
+    """解析环境变量中的 Vault 路径。"""
+    vault_path_str = os.environ.get("ARES_VAULT_PATH", "")
+    if not vault_path_str:
+        return None
+    vault_path = Path(vault_path_str).expanduser().resolve()
+    return vault_path if vault_path.exists() else None
+
+
+def _load_profile_for_team(team: str, config: dict, emit_console: bool = True) -> TacticalProfile:
+    """按当前配置加载单个球队档案。"""
+    vault_path = _resolve_vault_path()
+    subdir = config.get("obsidian", {}).get("team_archives_subdir", "02_Team_Archives")
+
+    if vault_path is not None:
+        profile = load_team_profile(team, vault_path=vault_path, subdir=subdir)
+    else:
+        if emit_console:
+            print_warning("ARES_VAULT_PATH 未设置或路径不存在，尝试从 examples/ 目录加载示例档案...")
+        examples_dir = Path(__file__).parent / "examples"
+        profile = load_team_profile(team, vault_path=examples_dir, subdir="")
+
+    if emit_console:
+        print_info(f"档案加载成功: {profile.team_name} (v{profile.version})")
+
+    return profile
+
+
+def _build_match_context(
+    trailing: bool,
+    stakes: Optional[str],
+    team_status: Optional[str],
+) -> dict[str, str]:
+    """构建熵值引擎所需的比赛语境。"""
+    match_context: dict[str, str] = {}
+    if trailing:
+        match_context["score_status"] = "Trailing"
+        match_context["time"] = "65"
+    if stakes:
+        match_context["stakes"] = stakes
+    if team_status:
+        match_context["team_status"] = team_status
+    return match_context
+
+
+def _execute_team_audit(
+    *,
+    team: str,
+    absent: list[str],
+    locked: list[str],
+    odds: Optional[tuple[float, float, float]],
+    away: bool,
+    trailing: bool,
+    stakes: Optional[str],
+    team_status: Optional[str],
+    points_gap: float,
+    xg_gap: float,
+    output_dir: Optional[Path] = None,
+    output_path: Optional[Path] = None,
+    save_report: bool = True,
+    emit_console: bool = True,
+) -> AuditExecutionResult:
+    """执行单支球队的完整审计流程。"""
+    config = _load_config()
+    engine_cfg = config.get("engine", {})
+    rag_cfg = config.get("rag", {})
+
+    if emit_console:
+        print_audit_header(team, match_info=" | ".join(absent) + " 缺阵" if absent else "")
+
+    profile = _load_profile_for_team(team, config=config, emit_console=emit_console)
+
+    if profile.is_stale and emit_console:
+        print_warning(
+            f"档案超过 {engine_cfg.get('s_source_ttl_days', 21)} 天未更新，战术标签可信度降权！"
+        )
+
+    entropy_input = EntropyInput(
+        team_name=profile.team_name,
+        tactical_entropy_base=profile.tactical_entropy_base,
+        system_fragility_threshold=profile.system_fragility_threshold,
+        key_node_dependency=profile.key_node_dependency,
+        tactical_logic=profile.tactical_logic,
+        absent_players=absent,
+        locked_players=locked,
+        match_context=_build_match_context(trailing, stakes, team_status),
+        xg=_safe_float(profile.raw_metadata.get("xG", profile.raw_metadata.get("xg", 0.0)), default=0.0),
+        passes_attacking_third=_safe_int(profile.raw_metadata.get("passes_attacking_third", 0), default=0),
+    )
+    entropy_result = compute_entropy(
+        entropy_input,
+        key_node_absence_penalty=engine_cfg.get("key_node_absence_penalty", 0.4),
+    )
+
+    if emit_console:
+        print_entropy_result(
+            team_name=entropy_result.team_name,
+            s_base=entropy_result.s_base,
+            s_dynamic=entropy_result.s_dynamic,
+            threshold=entropy_result.threshold,
+            key_nodes=profile.key_node_dependency,
+            status=entropy_result.status,
+        )
+
+    client = _get_chroma_client(rag_cfg.get("persist_directory", "./chromadb"))
+    collection = _get_or_create_collection(
+        client, rag_cfg.get("collection_name", "ares_tactical_memory")
+    )
+
+    llm_config = load_llm_config()
+    if emit_console:
+        print_info(f"LLM 配置: {llm_config.describe()}")
+
+    simulation_report = run_pressure_test(
+        team_name=profile.team_name,
+        key_node_dependency=profile.key_node_dependency,
+        tactical_logic=profile.tactical_logic,
+        absent_players=absent,
+        collection=collection,
+        top_k=rag_cfg.get("top_k", 3),
+        llm_config=llm_config,
+    )
+
+    if simulation_report.halt_triggered and emit_console:
+        print_halt("RAG 库中无法找到该球队在逆境下的历史样本")
+
+    if emit_console:
+        for result in simulation_report.scenario_results:
+            if result.is_halted:
+                console.print(
+                    f"[dim]⏭  {result.scenario_name}: 停机 — RAG 样本不足，Gemini 已拒绝推演[/dim]"
+                )
+            else:
+                print_simulation_result(
+                    scenario=result.scenario_name,
+                    result=result.llm_analysis,
+                )
+
+    ev_result = None
+    if odds:
+        home_odds, draw_odds, away_odds = odds
+        strength_gap_index = (points_gap * 1.0) + (xg_gap * 0.5)
+        odds_input = OddsInput(
+            team_name=profile.team_name,
+            home_odds=home_odds,
+            draw_odds=draw_odds,
+            away_odds=away_odds,
+            is_home=not away,
+            strength_gap_index=strength_gap_index,
+        )
+        ev_result = compute_ev(
+            odds_input=odds_input,
+            resilience_score=simulation_report.overall_resilience_score,
+            s_dynamic=entropy_result.s_dynamic,
+        )
+        if emit_console:
+            console.print(f"\n[bold]📊 EV 分析:[/bold] {ev_result.summary()}")
+
+    report_md = build_audit_report(entropy_result, simulation_report, ev_result)
+    saved_path: Optional[Path] = None
+
+    if save_report:
+        vault_path = _resolve_vault_path()
+        if vault_path is not None:
+            try:
+                saved_path = save_audit_report(
+                    str(vault_path),
+                    profile.team_name,
+                    report_md,
+                    output_dir=output_dir,
+                    output_path=output_path,
+                )
+                if emit_console:
+                    print_success(f"独立战报已落盘: {saved_path}")
+            except OSError as exc:
+                console.print(f"[red]❌ 战报写入失败: {exc}[/red]")
+        else:
+            if emit_console:
+                print_warning("ARES_VAULT_PATH 未配置，战报未写入磁盘。")
+                console.print(report_md)
+
+    if emit_console:
+        print_success(f"审计完成: {profile.team_name}")
+
+    return AuditExecutionResult(
+        profile=profile,
+        entropy_result=entropy_result,
+        simulation_report=simulation_report,
+        ev_result=ev_result,
+        report_md=report_md,
+        saved_path=saved_path,
+    )
+
+
+def _load_manifest(path: Path) -> dict[str, Any]:
+    """读取 issue 派发单。"""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_manifest_path(issue: str, manifest: Optional[str]) -> Path:
+    """解析 issue 对应的 dispatch manifest 路径。"""
+    if manifest:
+        return Path(manifest).expanduser().resolve()
+
+    vault_path = _resolve_vault_path()
+    if vault_path is not None:
+        candidate = vault_path / "04_RAG_Raw_Data" / "Cold_Data_Lake" / f"{issue}_dispatch_manifest.json"
+        if candidate.exists():
+            return candidate
+
+    fallback = Path.cwd() / "raw_reports" / f"{issue}_dispatch_manifest.json"
+    return fallback.resolve()
+
+
+def _split_match_english(english: str) -> tuple[str, str]:
+    """从 manifest 的 english 字段拆分主客队。"""
+    if " vs " in english:
+        home, away = english.split(" vs ", 1)
+        return home.strip(), away.strip()
+    if " VS " in english:
+        home, away = english.split(" VS ", 1)
+        return home.strip(), away.strip()
+    return english.strip(), "Away"
+
+
+def _sanitize_segment(value: str, fallback: str = "segment") -> str:
+    """规范化路径片段。"""
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value.strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or fallback
+
+
+def _latest_market_odds(match: dict[str, Any]) -> Optional[tuple[float, float, float]]:
+    """提取 manifest 中最新一组欧赔。"""
+    snapshots = match.get("market_odds_history") or []
+    if not snapshots:
+        return None
+    europe = snapshots[-1].get("europe") or {}
+    try:
+        return (
+            float(europe["win"]),
+            float(europe["draw"]),
+            float(europe["loss"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _build_match_audit_markdown(
+    *,
+    issue: str,
+    match: dict[str, Any],
+    home_result: AuditExecutionResult,
+    away_result: AuditExecutionResult,
+    odds: Optional[tuple[float, float, float]],
+) -> str:
+    """将单场主客队推演合成为 Prematch 审计文档。"""
+    header_lines = [
+        f"# Ares Prematch Audit - Issue {issue} - {match.get('english', 'Unknown Match')}",
+        "",
+        f"- 中文对阵: `{match.get('chinese', '')}`",
+        f"- 映射来源: `{match.get('mapping_source', 'unknown')}`",
+        f"- Understat ID: `{match.get('understat_id', '')}`",
+    ]
+    if odds:
+        header_lines.append(
+            f"- 最新欧赔: 主 `{odds[0]:.2f}` / 平 `{odds[1]:.2f}` / 客 `{odds[2]:.2f}`"
+        )
+
+    def _team_lines(side: str, result: AuditExecutionResult) -> list[str]:
+        lines = [
+            f"## {side} - {result.profile.team_name}",
+            f"- S_dynamic: `{result.entropy_result.s_dynamic:.3f}`",
+            f"- 状态: `{result.entropy_result.status}`",
+            f"- 整体韧性: `{result.simulation_report.overall_resilience_score:.3f}`",
+        ]
+        if result.entropy_result.risk_flags:
+            lines.append("- 风险标记: " + " | ".join(result.entropy_result.risk_flags[:5]))
+        if result.simulation_report.halt_triggered:
+            lines.append("- Prematch 结论: `[HALT] RAG 库逆境样本不足`")
+        if result.ev_result is not None:
+            lines.append(
+                f"- EV: `{result.ev_result.ev_tag}` | 市场 `{result.ev_result.market_implied_prob:.1%}` / 模型 `{result.ev_result.model_win_prob:.1%}`"
+            )
+            lines.append(f"- 决策: {result.ev_result.decision}")
+        return lines
+
+    lines = header_lines + [""] + _team_lines("Home", home_result) + [""] + _team_lines("Away", away_result)
+    return "\n".join(lines) + "\n"
+
+
+def _resolve_issue_output_file(vault_path: Path, issue: str, match: dict[str, Any]) -> Path:
+    """为单场 Prematch 审计解析输出文件路径。"""
+    prematch_dir = vault_path / "03_Match_Audits" / str(issue) / "01_Prematch_Audits"
+    prematch_dir.mkdir(parents=True, exist_ok=True)
+    index = _safe_int(match.get("index"), default=0)
+    prefix = f"Audit-{issue}-{index:02d}-"
+    existing = sorted(prematch_dir.glob(f"{prefix}*.md"))
+    if existing:
+        return existing[0]
+
+    english = str(match.get("english", f"Match-{index:02d}"))
+    home_team, away_team = _split_match_english(english)
+    filename = f"{prefix}{_sanitize_segment(home_team, 'Home')}-vs-{_sanitize_segment(away_team, 'Away')}.md"
+    return prematch_dir / filename
 
 
 # ── CLI 主命令组 ──────────────────────────────────────────────────────────────
@@ -130,9 +451,6 @@ def audit(
 ):
     """对指定球队执行完整的动态战术压力审计。"""
     print_banner()
-    config = _load_config()
-    engine_cfg = config.get("engine", {})
-    rag_cfg = config.get("rag", {})
 
     # CLI 参数覆盖环境变量（临时注入，不污染 .env）
     if provider:
@@ -142,148 +460,119 @@ def audit(
     if base_url:
         os.environ["ARES_LLM_BASE_URL"] = base_url
 
-    print_audit_header(team, match_info=" | ".join(absent) + " 缺阵" if absent else "")
-
-    # 1. 加载 Obsidian 档案
     try:
-        vault_path_str = os.environ.get("ARES_VAULT_PATH", "")
-        vault_path = Path(vault_path_str).expanduser().resolve() if vault_path_str else None
-        subdir = config.get("obsidian", {}).get("team_archives_subdir", "02_Team_Archives")
-
-        if vault_path and vault_path.exists():
-            profile = load_team_profile(team, vault_path=vault_path, subdir=subdir)
-        else:
-            print_warning(
-                f"ARES_VAULT_PATH 未设置或路径不存在，尝试从 examples/ 目录加载示例档案..."
-            )
-            examples_dir = Path(__file__).parent / "examples"
-            profile = load_team_profile(team, vault_path=examples_dir, subdir="")
+        _execute_team_audit(
+            team=team,
+            absent=list(absent),
+            locked=list(locked),
+            odds=odds,
+            away=away,
+            trailing=trailing,
+            stakes=stakes,
+            team_status=team_status,
+            points_gap=points_gap,
+            xg_gap=xg_gap,
+            save_report=True,
+            emit_console=True,
+        )
     except FileNotFoundError as exc:
         console.print(f"[red]❌ 档案加载失败: {exc}[/red]")
         sys.exit(1)
 
-    print_info(f"档案加载成功: {profile.team_name} (v{profile.version})")
+# ── scan 命令：批量扫描所有档案 ──────────────────────────────────────────────
 
-    # 2. 战术衰减检查
-    if profile.is_stale:
-        print_warning(
-            f"档案超过 {engine_cfg.get('s_source_ttl_days', 21)} 天未更新，"
-            "战术标签可信度降权！"
-        )
+@cli.command("audit-issue")
+@click.option("--issue", required=True, help="中国体彩期号，如 26064")
+@click.option("--manifest", default=None, type=click.Path(exists=True), help="显式指定 dispatch_manifest.json 路径")
+@click.option("--limit", type=int, default=None, help="仅处理前 N 场比赛（调试用）")
+def audit_issue(issue: str, manifest: Optional[str], limit: Optional[int]):
+    """按 issue 批量执行 Prematch 推演，并写入治理目录。"""
+    print_banner()
 
-    # 3. 熵值计算
-    match_context = {}
-    if trailing:
-        match_context["score_status"] = "Trailing"
-        match_context["time"] = "65"
-    if stakes:
-        match_context["stakes"] = stakes
-    if team_status:
-        match_context["team_status"] = team_status
+    vault_path = _resolve_vault_path()
+    if vault_path is None:
+        console.print("[red]❌ audit-issue 需要有效的 ARES_VAULT_PATH。[/red]")
+        sys.exit(1)
 
-    entropy_input = EntropyInput(
-        team_name=profile.team_name,
-        tactical_entropy_base=profile.tactical_entropy_base,
-        system_fragility_threshold=profile.system_fragility_threshold,
-        key_node_dependency=profile.key_node_dependency,
-        tactical_logic=profile.tactical_logic,
-        absent_players=list(absent),
-        locked_players=list(locked),
-        match_context=match_context,
-        xg=_safe_float(
-            profile.raw_metadata.get("xG", profile.raw_metadata.get("xg", 0.0)),
-            default=0.0,
-        ),
-        passes_attacking_third=_safe_int(
-            profile.raw_metadata.get("passes_attacking_third", 0),
-            default=0,
-        ),
-    )
-    entropy_result = compute_entropy(
-        entropy_input,
-        key_node_absence_penalty=engine_cfg.get("key_node_absence_penalty", 0.4),
-    )
+    manifest_path = _resolve_manifest_path(issue, manifest)
+    if not manifest_path.exists():
+        console.print(f"[red]❌ 找不到 dispatch_manifest: {manifest_path}[/red]")
+        sys.exit(1)
 
-    print_entropy_result(
-        team_name=entropy_result.team_name,
-        s_base=entropy_result.s_base,
-        s_dynamic=entropy_result.s_dynamic,
-        threshold=entropy_result.threshold,
-        key_nodes=profile.key_node_dependency,
-        status=entropy_result.status,
-    )
+    payload = _load_manifest(manifest_path)
+    matches = payload.get("matches", [])
+    if not isinstance(matches, list) or not matches:
+        console.print(f"[red]❌ manifest 中没有可处理的 matches: {manifest_path}[/red]")
+        sys.exit(1)
 
-    # 4. RAG 压力测试
-    client = _get_chroma_client(rag_cfg.get("persist_directory", "./chromadb"))
-    collection = _get_or_create_collection(
-        client, rag_cfg.get("collection_name", "ares_tactical_memory")
-    )
+    processed = 0
+    failed = 0
+    target_matches = matches[:limit] if limit else matches
 
-    llm_config = load_llm_config()
-    print_info(f"LLM 配置: {llm_config.describe()}")
+    for match in target_matches:
+        english = str(match.get("english", "")).strip()
+        if not english:
+            logger.warning("跳过缺少 english 字段的比赛: %s", match)
+            failed += 1
+            continue
 
-    simulation_report = run_pressure_test(
-        team_name=profile.team_name,
-        key_node_dependency=profile.key_node_dependency,
-        tactical_logic=profile.tactical_logic,
-        absent_players=list(absent),
-        collection=collection,
-        top_k=rag_cfg.get("top_k", 3),
-        llm_config=llm_config,
-    )
+        home_team, away_team = _split_match_english(english)
+        odds = _latest_market_odds(match)
+        output_file = _resolve_issue_output_file(vault_path, issue, match)
 
-    if simulation_report.halt_triggered:
-        print_halt("RAG 库中无法找到该球队在逆境下的历史样本")
+        print_info(f"[Issue {issue}] Prematch 推演: {english}")
 
-    for result in simulation_report.scenario_results:
-        if result.is_halted:
-            console.print(
-                f"[dim]⏭  {result.scenario_name}: 停机 — RAG 样本不足，Gemini 已拒绝推演[/dim]"
-            )
-        else:
-            print_simulation_result(
-                scenario=result.scenario_name,
-                result=result.llm_analysis,
-            )
-
-    # 5. EV 市场解耦分析（仅在提供赔率时执行）
-    ev_result = None
-    if odds:
-        home_odds, draw_odds, away_odds = odds
-        
-        # 计算 Strength Gap Index
-        strength_gap_index = (points_gap * 1.0) + (xg_gap * 0.5)
-        
-        odds_input = OddsInput(
-            team_name=profile.team_name,
-            home_odds=home_odds,
-            draw_odds=draw_odds,
-            away_odds=away_odds,
-            is_home=not away,
-            strength_gap_index=strength_gap_index,
-        )
-        ev_result = compute_ev(
-            odds_input=odds_input,
-            resilience_score=simulation_report.overall_resilience_score,
-            s_dynamic=entropy_result.s_dynamic,
-        )
-        console.print(f"\n[bold]📊 EV 分析:[/bold] {ev_result.summary()}")
-
-    # 6. 生成战报并落盘到 03_Match_Audits/
-    report_md = build_audit_report(entropy_result, simulation_report, ev_result)
-
-    vault_path_str = os.environ.get("ARES_VAULT_PATH", "")
-    if vault_path_str:
         try:
-            saved_path = save_audit_report(vault_path_str, profile.team_name, report_md)
-            print_success(f"独立战报已落盘: {saved_path}")
-        except OSError as exc:
-            console.print(f"[red]❌ 战报写入失败: {exc}[/red]")
-    else:
-        print_warning("ARES_VAULT_PATH 未配置，战报未写入磁盘。")
-        console.print(report_md)
+            home_result = _execute_team_audit(
+                team=home_team,
+                absent=[],
+                locked=[],
+                odds=odds,
+                away=False,
+                trailing=False,
+                stakes=None,
+                team_status=None,
+                points_gap=0.0,
+                xg_gap=0.0,
+                save_report=False,
+                emit_console=False,
+            )
+            away_result = _execute_team_audit(
+                team=away_team,
+                absent=[],
+                locked=[],
+                odds=odds,
+                away=True,
+                trailing=False,
+                stakes=None,
+                team_status=None,
+                points_gap=0.0,
+                xg_gap=0.0,
+                save_report=False,
+                emit_console=False,
+            )
+        except FileNotFoundError as exc:
+            logger.error("Prematch 推演失败 [%s]: %s", english, exc)
+            failed += 1
+            continue
 
-    print_success(f"审计完成: {profile.team_name}")
+        combined_report = _build_match_audit_markdown(
+            issue=issue,
+            match=match,
+            home_result=home_result,
+            away_result=away_result,
+            odds=odds,
+        )
+        try:
+            output_file.write_text(combined_report, encoding="utf-8")
+        except OSError as exc:
+            logger.error("Prematch 审计写入失败 [%s]: %s", english, exc)
+            failed += 1
+            continue
+        print_success(f"Prematch 审计已写入: {output_file}")
+        processed += 1
+
+    print_info(f"audit-issue 完成: 成功 {processed} / 失败 {failed}")
 
 
 # ── scan 命令：批量扫描所有档案 ──────────────────────────────────────────────

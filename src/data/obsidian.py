@@ -28,9 +28,21 @@ REQUIRED_FIELDS = {
 }
 
 TACTICAL_LOGIC_KEYS = {"P", "Space", "F", "H", "Set_Piece"}
+DEFAULT_TACTICAL_LOGIC = {
+    "P": "P3",
+    "Space": "H",
+    "F": "M",
+    "H": "M",
+    "Set_Piece": "N",
+}
 
 # 匹配玩家名后面的中文备注，如 "Rodri (单后腰/攻防枢纽)" → "Rodri"
 _PLAYER_ANNOTATION_RE = re.compile(r"\s*[\(\（].*[\)\）]\s*$")
+
+
+def _normalize_team_lookup(raw: str) -> str:
+    """标准化球队名，便于跨系统文件命名对齐。"""
+    return re.sub(r"[^a-z0-9]+", "", raw.lower())
 
 
 @dataclass
@@ -163,6 +175,54 @@ def verify_with_osint(team_name: str, local_metadata: dict) -> dict:
     return local_metadata
 
 
+def _upgrade_v42_metadata(metadata: dict[str, Any], team_name: str) -> dict[str, Any]:
+    """
+    将 v4.2 Team Archive schema 映射为当前熵值引擎可消费的兼容字段。
+
+    v4.2:
+      intel_base / physical_reality / reality_gap
+    legacy engine:
+      tactical_entropy_base / key_node_dependency / tactical_logic
+    """
+    if REQUIRED_FIELDS <= set(metadata.keys()):
+        return metadata
+
+    intel_base = metadata.get("intel_base")
+    physical_reality = metadata.get("physical_reality")
+    reality_gap = metadata.get("reality_gap")
+    if not isinstance(intel_base, dict) or not isinstance(physical_reality, dict):
+        return metadata
+
+    upgraded = dict(metadata)
+    upgraded.setdefault("version", 4.2)
+    upgraded.setdefault(
+        "tactical_entropy_base",
+        float(physical_reality.get("actual_tactical_entropy", 0.4)),
+    )
+    upgraded.setdefault("system_fragility_threshold", 0.7)
+    upgraded.setdefault(
+        "key_node_dependency",
+        list(intel_base.get("key_node_dependency", [])),
+    )
+    upgraded.setdefault(
+        "tactical_logic",
+        dict(intel_base.get("tactical_logic", DEFAULT_TACTICAL_LOGIC)),
+    )
+    upgraded.setdefault("xG", float(physical_reality.get("avg_xG_last_5", 0.0)))
+    upgraded.setdefault(
+        "passes_attacking_third",
+        int(physical_reality.get("passes_attacking_third_last_5", 0)),
+    )
+
+    if not intel_base.get("tactical_logic"):
+        logger.warning(
+            "[%s] v4.2 档案缺少 tactical_logic，已使用中性默认值 %s",
+            team_name,
+            DEFAULT_TACTICAL_LOGIC,
+        )
+    return upgraded
+
+
 def _validate_metadata(metadata: dict[str, Any], file_path: Path) -> list[str]:
     """校验 YAML 元数据的必填字段，返回错误信息列表（空表示通过）。"""
     errors: list[str] = []
@@ -215,6 +275,8 @@ def _parse_single_file(md_path: Path) -> TacticalProfile:
                     missing.discard(key)
             if body_params:
                 logger.debug(f"从正文提取 v4.0 参数: {list(body_params.keys())}")
+
+    metadata = _upgrade_v42_metadata(metadata, md_path.stem)
 
     validation_errors = _validate_metadata(metadata, md_path)
     if validation_errors:
@@ -337,6 +399,12 @@ def load_team_profile(
             p for p in search_root.rglob("*.md")
             if team_name.lower() in p.stem.lower()
         ]
+    if not candidates:
+        normalized_target = _normalize_team_lookup(team_name)
+        candidates = [
+            p for p in search_root.rglob("*.md")
+            if _normalize_team_lookup(p.stem) == normalized_target
+        ]
 
     if not candidates:
         raise FileNotFoundError(
@@ -345,7 +413,18 @@ def load_team_profile(
 
     if len(candidates) > 1:
         logger.warning(
-            f"找到 {len(candidates)} 个匹配档案，将使用第一个: {candidates[0]}"
+            f"找到 {len(candidates)} 个匹配档案，将依次尝试解析: {candidates[0]}"
         )
 
-    return _parse_single_file(candidates[0])
+    parse_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _parse_single_file(candidate)
+        except ValueError as exc:
+            parse_errors.append(f"{candidate}: {exc}")
+            continue
+
+    raise FileNotFoundError(
+        f"在 {search_root} 中找到了候选文件，但没有可用的球队档案: {team_name}\n"
+        + "\n".join(parse_errors[:3])
+    )
