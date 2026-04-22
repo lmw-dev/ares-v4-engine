@@ -334,6 +334,21 @@ def _latest_market_odds(match: dict[str, Any]) -> Optional[tuple[float, float, f
         return None
 
 
+def _rag_collection_doc_count() -> int:
+    """返回当前 RAG 集合的总文档数。"""
+    config = _load_config()
+    rag_cfg = config.get("rag", {})
+    client = _get_chroma_client(rag_cfg.get("persist_directory", "./chromadb"))
+    collection = _get_or_create_collection(
+        client,
+        rag_cfg.get("collection_name", "ares_tactical_memory"),
+    )
+    try:
+        return int(collection.count())
+    except Exception:
+        return 0
+
+
 def _build_match_audit_markdown(
     *,
     issue: str,
@@ -498,6 +513,12 @@ def audit_issue(issue: str, manifest: Optional[str], limit: Optional[int]):
     if not manifest_path.exists():
         console.print(f"[red]❌ 找不到 dispatch_manifest: {manifest_path}[/red]")
         sys.exit(1)
+
+    rag_count = _rag_collection_doc_count()
+    if rag_count == 0:
+        console.print("[red]❌ RAG 集合为空，无法执行 Prematch 推演。请先通过 `main.py add-doc` 导入战术文档。[/red]")
+        sys.exit(2)
+    print_info(f"RAG 集合已就绪: {rag_count} 条文档")
 
     payload = _load_manifest(manifest_path)
     matches = payload.get("matches", [])
