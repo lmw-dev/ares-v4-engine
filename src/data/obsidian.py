@@ -392,18 +392,28 @@ def load_team_profile(
 
     archives_dir = vault_path / subdir
     search_root = archives_dir if archives_dir.exists() else vault_path
+    alias_candidates = {
+        "Paris Saint Germain": "PSG",
+        "Paris_Saint_Germain": "PSG",
+    }
+    lookup_names = [team_name]
+    alias_name = alias_candidates.get(team_name)
+    if alias_name and alias_name not in lookup_names:
+        lookup_names.append(alias_name)
 
-    candidates = list(search_root.rglob(f"{team_name}.md"))
+    candidates: list[Path] = []
+    for lookup_name in lookup_names:
+        candidates.extend(search_root.rglob(f"{lookup_name}.md"))
     if not candidates:
         candidates = [
             p for p in search_root.rglob("*.md")
-            if team_name.lower() in p.stem.lower()
+            if any(name.lower() in p.stem.lower() for name in lookup_names)
         ]
     if not candidates:
-        normalized_target = _normalize_team_lookup(team_name)
+        normalized_targets = {_normalize_team_lookup(name) for name in lookup_names}
         candidates = [
             p for p in search_root.rglob("*.md")
-            if _normalize_team_lookup(p.stem) == normalized_target
+            if _normalize_team_lookup(p.stem) in normalized_targets
         ]
 
     if not candidates:

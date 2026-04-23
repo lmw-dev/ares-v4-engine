@@ -11,7 +11,10 @@ Ares v4.0 - What-If 压力测试模拟引擎
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import chromadb
@@ -23,6 +26,12 @@ from src.utils.logger import setup_logger
 logger = setup_logger("ares.simulator")
 
 HALT_MARKER = "[Unknown: Insufficient Resilience Data]"
+
+
+def _canonical_team_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_")
+    return cleaned or str(value).strip().replace(" ", "_")
 
 
 @dataclass
@@ -74,8 +83,11 @@ class SimulationReport:
 
 def _get_chroma_client(persist_directory: str = "./chromadb") -> chromadb.PersistentClient:
     """初始化并返回 ChromaDB 持久化客户端。"""
+    persist_path = Path(persist_directory)
+    if not persist_path.is_absolute():
+        persist_path = Path(__file__).resolve().parents[2] / persist_path
     return chromadb.PersistentClient(
-        path=persist_directory,
+        path=str(persist_path),
         settings=Settings(anonymized_telemetry=False),
     )
 
@@ -146,10 +158,12 @@ _SYSTEM_PROMPT = """你是 Ares 战术分析引擎的核心推演模块。
 规则：
 1. 仅基于提供的历史案例进行推理，不得捏造数据。
 2. 如果案例样本不足以支撑结论，明确输出: """ + HALT_MARKER + """
-3. 输出格式：
-   - 情景分析（2-3句）
-   - 防线退化/战术坍塌概率预估（0-100%）
-   - 关键风险点（1-2条）
+3. 你必须严格输出以下结构：
+   情景分析: <2-3句>
+   成功率预估: <0-100之间的整数百分比，必须带%号>
+   关键风险点:
+   - <风险点1>
+   - <风险点2，可选>
 """
 
 
@@ -176,6 +190,7 @@ def _build_whatif_prompt(
 {context_block}
 
 请基于以上信息，对该球队在此压力情景下的战术鲁棒性进行推演评估。
+注意：必须包含一行 `成功率预估: XX%`，否则输出视为无效。
 """
 
 
@@ -198,9 +213,29 @@ def _call_llm(prompt: str, llm_config: Optional[LLMConfig] = None) -> str:
 
 def _extract_success_rate(llm_output: str) -> float:
     """从 LLM 输出中提取概率数字（简单启发式解析）。"""
-    import re
     if HALT_MARKER in llm_output:
         return 0.0
+
+    labeled_patterns = [
+        r"成功率预估[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+        r"成功概率[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+        r"概率预估[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+        r"坍塌概率[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+        r"退化概率[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+    ]
+    for pattern in labeled_patterns:
+        match = re.search(pattern, llm_output)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+        if value <= 1.0:
+            return round(value, 3)
+        if value <= 100.0:
+            return round(value / 100.0, 3)
+
     matches = re.findall(r"(\d{1,3})\s*%", llm_output)
     if not matches:
         return 0.0
@@ -293,12 +328,14 @@ def run_pressure_test(
     for scenario in scenarios:
         logger.info(f"[{team_name}] 执行 {scenario.name}...")
 
-        # 关键节点过滤：场景A 使用缺阵球员加强检索
-        filter_meta = None
-        if "核心坍塌" in scenario.name and absent_players:
-            pass  # ChromaDB 目前按文本检索即可
-
-        contexts = retrieve_contexts(collection, scenario.query, top_k=top_k)
+        filter_meta = {"team": _canonical_team_key(team_name)}
+        query_text = f"{team_name} {scenario.query}".strip()
+        contexts = retrieve_contexts(
+            collection,
+            query_text,
+            top_k=top_k,
+            filter_metadata=filter_meta,
+        )
 
         # 停机检查：场景A 无样本时强制输出 Unknown
         if "核心坍塌" in scenario.name and not contexts:

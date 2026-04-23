@@ -49,15 +49,23 @@ cp .env.example .env
 #   DISCORD_WEBHOOK_URL - Discord Webhook（可选）
 ```
 
-### 3. 导入 RAG 情报文档
+### 3. 导入 / 重建 RAG 情报文档
 
 ```bash
-# 将战术分析文章导入向量数据库
+# 优先推荐：从 Vault 赛后运行态批量重建 RAG
+python main.py sync-rag-runtime
+
+# 或者：手工导入单条战术分析文章
 python main.py add-doc \
   --file examples/rag_seed_manchestercity.txt \
   --team "曼城 (Man City)" \
   --source-level S
 ```
+
+说明：
+- `sync-rag-runtime` 会读取 `$ARES_VAULT_PATH/02_Team_Archives/_Postmatch_Runtime/**/*.jsonl`
+- 自动把赛后物理事实转成可检索的 Prematch RAG 样本
+- `chromadb` 相对路径现在固定按 `20-engine` 仓库根目录解析，不受当前 shell cwd 影响
 
 ### 4. 执行审计
 

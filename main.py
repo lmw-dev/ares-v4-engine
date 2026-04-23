@@ -9,12 +9,15 @@ Ares v4.0 动态战术压力审计引擎 - 主程序入口
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import click
 import yaml
@@ -86,6 +89,12 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _canonical_team_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_")
+    return cleaned or str(value).strip().replace(" ", "_")
+
+
 def _resolve_vault_path() -> Optional[Path]:
     """解析环境变量中的 Vault 路径。"""
     vault_path_str = os.environ.get("ARES_VAULT_PATH", "")
@@ -93,6 +102,135 @@ def _resolve_vault_path() -> Optional[Path]:
         return None
     vault_path = Path(vault_path_str).expanduser().resolve()
     return vault_path if vault_path.exists() else None
+
+
+def _resolve_runtime_root(vault_path: Path) -> Path:
+    return vault_path / "02_Team_Archives" / "_Postmatch_Runtime"
+
+
+def _iter_runtime_history_files(runtime_root: Path) -> Iterable[Path]:
+    if not runtime_root.exists():
+        return []
+    return sorted(runtime_root.rglob("postmatch_history.jsonl"))
+
+
+def _build_runtime_tags(entry: dict[str, Any]) -> list[str]:
+    score_for = _safe_int(entry.get("score_for"))
+    score_against = _safe_int(entry.get("score_against"))
+    xg_for = _safe_float(entry.get("xg_for"))
+    xg_against = _safe_float(entry.get("xg_against"))
+    shots_against = _safe_int(entry.get("shots_on_target_against"))
+    passes_att_third = _safe_int(entry.get("passes_attacking_third_for"))
+    variance_flag = bool(entry.get("variance_flag"))
+
+    tags: list[str] = []
+    if score_for < score_against:
+        tags.append("score_trailing_pressure")
+    if xg_for - score_for >= 0.75:
+        tags.append("finishing_regression")
+    if xg_against >= 1.5 or shots_against >= 6:
+        tags.append("defensive_leakage")
+    if passes_att_third >= 15 and score_for == 0:
+        tags.append("decision_stall")
+    if variance_flag:
+        tags.append("variance_alert")
+    if not tags:
+        tags.append("baseline_match_sample")
+    return tags
+
+
+def _build_runtime_rag_document(entry: dict[str, Any]) -> str:
+    team = str(entry.get("team", "Unknown Team"))
+    opponent = str(entry.get("opponent", "Unknown Opponent"))
+    score_for = _safe_int(entry.get("score_for"))
+    score_against = _safe_int(entry.get("score_against"))
+    xg_for = _safe_float(entry.get("xg_for"))
+    xg_against = _safe_float(entry.get("xg_against"))
+    shots_for = _safe_int(entry.get("shots_on_target_for"))
+    shots_against = _safe_int(entry.get("shots_on_target_against"))
+    passes_for = _safe_int(entry.get("passes_attacking_third_for"))
+    passes_against = _safe_int(entry.get("passes_attacking_third_against"))
+    tags = _build_runtime_tags(entry)
+
+    return "\n".join(
+        [
+            f"球队逆境运行样本: {team}",
+            f"对手: {opponent}",
+            f"比赛ID: {entry.get('match_id', '')}",
+            f"期号: {entry.get('issue', '')}",
+            f"主客: {'Home' if bool(entry.get('is_home')) else 'Away'}",
+            f"比分: {score_for}-{score_against}",
+            f"xG: {xg_for:.3f}-{xg_against:.3f}",
+            f"射正: {shots_for}-{shots_against}",
+            f"进攻三区传球: {passes_for}-{passes_against}",
+            f"波动标记: {'Yes' if bool(entry.get('variance_flag')) else 'No'}",
+            f"场景标签: {', '.join(tags)}",
+            "样本说明:",
+            "- 该文档由赛后物理事实自动生成，用于 Prematch What-If 压力检索。",
+            f"- 球队 {team} 在本场面对 {opponent} 时的真实运行数据可作为逆境/承压参考。",
+            f"- 若标签包含 score_trailing_pressure / defensive_leakage / decision_stall / variance_alert，则优先视为高压样本。",
+            f"- 数据源: {entry.get('data_source', 'unknown')} | 引用: {entry.get('data_source_ref', '')}",
+        ]
+    )
+
+
+def _sync_runtime_rag(
+    *,
+    collection: Any,
+    runtime_root: Path,
+    team_filter: Optional[str] = None,
+) -> dict[str, int]:
+    files = _iter_runtime_history_files(runtime_root)
+    stats = {"files": 0, "entries": 0, "upserts": 0, "skipped": 0}
+    wanted_team = _canonical_team_key(team_filter) if team_filter else None
+
+    for history_path in files:
+        stats["files"] += 1
+        try:
+            lines = history_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            logger.warning("读取运行态历史失败 [%s]: %s", history_path, exc)
+            continue
+
+        for raw in lines:
+            if not raw.strip():
+                continue
+            stats["entries"] += 1
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                logger.warning("跳过坏行 [%s]: %s", history_path, exc)
+                stats["skipped"] += 1
+                continue
+
+            team_name = str(entry.get("team", "")).strip()
+            if not team_name:
+                stats["skipped"] += 1
+                continue
+
+            canonical_team = _canonical_team_key(team_name)
+            if wanted_team and canonical_team != wanted_team:
+                continue
+
+            match_id = str(entry.get("match_id") or entry.get("issue") or f"row{stats['entries']}")
+            doc_id = hashlib.md5(f"runtime:{canonical_team}:{match_id}".encode("utf-8")).hexdigest()[:16]
+            add_document_to_rag(
+                collection=collection,
+                doc_id=doc_id,
+                content=_build_runtime_rag_document(entry),
+                metadata={
+                    "team": canonical_team,
+                    "team_display": team_name,
+                    "opponent": _canonical_team_key(str(entry.get("opponent", "")).strip()),
+                    "source_level": "RUNTIME",
+                    "issue": str(entry.get("issue", "")).strip(),
+                    "match_id": match_id,
+                    "file": str(history_path),
+                },
+            )
+            stats["upserts"] += 1
+
+    return stats
 
 
 def _load_profile_for_team(team: str, config: dict, emit_console: bool = True) -> TacticalProfile:
@@ -349,6 +487,17 @@ def _rag_collection_doc_count() -> int:
         return 0
 
 
+def _rag_collection() -> Any:
+    """返回当前配置下的 Chroma collection。"""
+    config = _load_config()
+    rag_cfg = config.get("rag", {})
+    client = _get_chroma_client(rag_cfg.get("persist_directory", "./chromadb"))
+    return _get_or_create_collection(
+        client,
+        rag_cfg.get("collection_name", "ares_tactical_memory"),
+    )
+
+
 def _build_match_audit_markdown(
     *,
     issue: str,
@@ -516,7 +665,7 @@ def audit_issue(issue: str, manifest: Optional[str], limit: Optional[int]):
 
     rag_count = _rag_collection_doc_count()
     if rag_count == 0:
-        console.print("[red]❌ RAG 集合为空，无法执行 Prematch 推演。请先通过 `main.py add-doc` 导入战术文档。[/red]")
+        console.print("[red]❌ RAG 集合为空，无法执行 Prematch 推演。请先通过 `main.py sync-rag-runtime` 或 `main.py add-doc` 导入战术文档。[/red]")
         sys.exit(2)
     print_info(f"RAG 集合已就绪: {rag_count} 条文档")
 
@@ -674,7 +823,6 @@ def add_doc(file: str, team: str, source_level: str, doc_id: Optional[str]):
 
     content = Path(file).read_text(encoding="utf-8")
     if not doc_id:
-        import hashlib
         doc_id = hashlib.md5(f"{team}:{file}:{content[:100]}".encode()).hexdigest()[:12]
 
     client = _get_chroma_client(rag_cfg.get("persist_directory", "./chromadb"))
@@ -686,9 +834,48 @@ def add_doc(file: str, team: str, source_level: str, doc_id: Optional[str]):
         collection=collection,
         doc_id=doc_id,
         content=content,
-        metadata={"team": team, "source_level": source_level, "file": file},
+        metadata={
+            "team": _canonical_team_key(team),
+            "team_display": team,
+            "source_level": source_level,
+            "file": file,
+        },
     )
     print_success(f"文档已导入 RAG 库 [{source_level}级情报]: {file} → ID={doc_id}")
+
+
+@cli.command("rag-status")
+def rag_status():
+    """输出当前 RAG 集合状态。"""
+    print_banner()
+    collection = _rag_collection()
+    print_info(f"RAG 集合文档数: {collection.count()}")
+
+
+@cli.command("sync-rag-runtime")
+@click.option("--team", default=None, help="仅同步指定球队（可选）")
+def sync_rag_runtime(team: Optional[str]):
+    """从 Vault 的 _Postmatch_Runtime 批量同步 RAG 样本。"""
+    print_banner()
+    vault_path = _resolve_vault_path()
+    if vault_path is None:
+        console.print("[red]❌ sync-rag-runtime 需要有效的 ARES_VAULT_PATH。[/red]")
+        sys.exit(1)
+
+    runtime_root = _resolve_runtime_root(vault_path)
+    if not runtime_root.exists():
+        console.print(f"[red]❌ 找不到运行态目录: {runtime_root}[/red]")
+        sys.exit(1)
+
+    collection = _rag_collection()
+    before = collection.count()
+    stats = _sync_runtime_rag(collection=collection, runtime_root=runtime_root, team_filter=team)
+    after = collection.count()
+    print_success(
+        "RAG 运行态同步完成: "
+        f"files={stats['files']} entries={stats['entries']} upserts={stats['upserts']} "
+        f"skipped={stats['skipped']} total={after} (before={before})"
+    )
 
 
 # ── 程序入口 ──────────────────────────────────────────────────────────────────
